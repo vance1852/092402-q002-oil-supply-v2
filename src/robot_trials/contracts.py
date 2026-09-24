@@ -6,26 +6,36 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
+from .clock import instant_text
+
 
 class ValidationError(ValueError):
     """输入不能满足领域契约。"""
 
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        super().__init__(message)
+        self.field = field
+
+
+def _fail(message: str, path: str) -> "ValidationError":
+    return ValidationError(message, field=path)
+
 
 def _require_mapping(value: object, path: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValidationError(f"{path} 必须是对象")
+        raise _fail(f"{path} 必须是对象", path)
     return value
 
 
 def _require_sequence(value: object, path: str) -> Sequence[Any]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValidationError(f"{path} 必须是数组")
+        raise _fail(f"{path} 必须是数组", path)
     return value
 
 
 def _required_text(value: object, path: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValidationError(f"{path} 必须是非空字符串")
+        raise _fail(f"{path} 必须是非空字符串", path)
     return value.strip()
 
 
@@ -37,14 +47,21 @@ def _optional_text(value: object, path: str) -> str | None:
 
 def _decimal(value: object, path: str) -> Decimal:
     if isinstance(value, bool):
-        raise ValidationError(f"{path} 必须是数值")
+        raise _fail(f"{path} 必须是数值", path)
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise ValidationError(f"{path} 必须是十进制数值") from exc
+        raise _fail(f"{path} 必须是十进制数值", path) from exc
     if not result.is_finite():
-        raise ValidationError(f"{path} 必须是有限数值")
+        raise _fail(f"{path} 必须是有限数值", path)
     return result
+
+
+def _instant(value: object, path: str) -> str:
+    try:
+        return instant_text(value, path)
+    except ValueError as exc:
+        raise _fail(str(exc), path) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,25 +235,29 @@ class Observation:
         protocol_id = _required_text(data.get("protocol_id"), "observation.protocol_id")
         protocol_version = data.get("protocol_version")
         if protocol_id != protocol.protocol_id or protocol_version != protocol.version:
-            raise ValidationError("观测引用的协议版本与当前协议不一致")
+            raise _fail("观测引用的协议版本与当前协议不一致", "observation.protocol_version")
         stratum_key = _required_text(data.get("stratum_key"), "observation.stratum_key")
         if stratum_key not in protocol.stratum_keys:
-            raise ValidationError("observation.stratum_key 未在协议中声明")
+            raise _fail("observation.stratum_key 未在协议中声明", "observation.stratum_key")
         metric_data = _require_mapping(data.get("metrics"), "observation.metrics")
         expected = protocol.metric_map
         missing = sorted(set(expected) - set(metric_data))
         extra = sorted(set(metric_data) - set(expected))
         if missing or extra:
-            raise ValidationError(f"观测指标不匹配：缺少 {missing}，多出 {extra}")
+            raise ValidationError(f"观测指标不匹配：缺少 {missing}，多出 {extra}", field="observation.metrics")
         parsed: dict[str, Decimal] = {}
         for key, value in metric_data.items():
             metric = expected[key]
-            number = _decimal(value, f"observation.metrics.{key}")
+            metric_path = f"observation.metrics.{key}"
+            number = _decimal(value, metric_path)
             if metric.kind == "binary" and number not in {Decimal(0), Decimal(1)}:
-                raise ValidationError(f"observation.metrics.{key} 必须是 0 或 1")
+                raise _fail(f"{metric_path} 必须是 0 或 1", metric_path)
             if metric.kind == "count" and number != number.to_integral_value():
-                raise ValidationError(f"observation.metrics.{key} 必须是整数")
+                raise _fail(f"{metric_path} 必须是非负整数", metric_path)
+            if metric.kind == "count" and number < 0:
+                raise _fail(f"{metric_path} 不能为负数", metric_path)
             parsed[key] = number
+        observed_at = _instant(data.get("observed_at"), "observation.observed_at")
         return cls(
             source_batch=_required_text(data.get("source_batch"), "observation.source_batch"),
             source_row=_required_text(data.get("source_row"), "observation.source_row"),
@@ -244,7 +265,7 @@ class Observation:
             protocol_id=protocol_id,
             protocol_version=protocol.version,
             stratum_key=stratum_key,
-            observed_at=_required_text(data.get("observed_at"), "observation.observed_at"),
+            observed_at=observed_at,
             metrics=parsed,
             excluded_reason=_optional_text(data.get("excluded_reason"), "observation.excluded_reason"),
         )

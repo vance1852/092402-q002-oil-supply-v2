@@ -57,6 +57,57 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def _observation_raw(self, **overrides: object) -> dict[str, object]:
+        raw = {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": "2026-09-21T10:00:00+08:00",
+            "metrics": {"completed": 1, "completion_seconds": 4, "interventions": 0},
+            "excluded_reason": None,
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_observed_at_requires_timezone(self) -> None:
+        raw = self._observation_raw(observed_at="2026-09-21T10:00:00")
+        with self.assertRaisesRegex(ValidationError, "时区") as ctx:
+            Observation.from_dict(raw, self.protocol)
+        self.assertEqual(ctx.exception.field, "observation.observed_at")
+
+    def test_observed_at_rejects_date_only_and_garbage(self) -> None:
+        for value in ("2026-09-21", "昨天上午十点", "2026-09-21T10:00:00Zulu", 202609211000):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError) as ctx:
+                    Observation.from_dict(self._observation_raw(observed_at=value), self.protocol)
+                self.assertEqual(ctx.exception.field, "observation.observed_at")
+
+    def test_observed_at_is_normalized_to_utc_z(self) -> None:
+        observation = Observation.from_dict(
+            self._observation_raw(observed_at="2026-09-21T10:00:00+08:00"), self.protocol
+        )
+        self.assertEqual(observation.observed_at, "2026-09-21T02:00:00Z")
+        zulu = Observation.from_dict(
+            self._observation_raw(observed_at="2026-09-21T02:00:00Z"), self.protocol
+        )
+        self.assertEqual(zulu.observed_at, observation.observed_at)
+
+    def test_count_metric_rejects_negative_and_fraction(self) -> None:
+        for value, reason in ((-1, "负数"), ("-0.5", "非负整数")):
+            raw = self._observation_raw(
+                metrics={"completed": 1, "completion_seconds": 4, "interventions": value}
+            )
+            with self.subTest(value=value), self.assertRaisesRegex(ValidationError, reason) as ctx:
+                Observation.from_dict(raw, self.protocol)
+            self.assertEqual(ctx.exception.field, "observation.metrics.interventions")
+
+    def test_count_metric_accepts_zero(self) -> None:
+        observation = Observation.from_dict(self._observation_raw(), self.protocol)
+        self.assertEqual(observation.metrics["interventions"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

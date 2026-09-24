@@ -210,7 +210,7 @@ class TrialService:
         self._require(actor_id, "observation.import")
         rows = tuple(raw_rows)
         if not rows:
-            raise ValidationFailed("观测数组不能为空")
+            raise ValidationFailed("观测数组不能为空", details={"field": "observations"})
         request_digest = content_digest(rows)
         scope = f"observations:{batch_id}"
         existing = self._idempotent_response(scope, idempotency_key, request_digest)
@@ -220,23 +220,36 @@ class TrialService:
         if batch["state"] != "running":
             raise InvalidState("只有运行中的批次可以导入观测")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        build = self.connection.execute(
+            "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
+        ).fetchone()
+        expected_robot = None if build is None else build["robot_id"]
+        # 先完整校验所有行，任何一行不合法都不进入写事务，保证不留下观测、幂等响应或审计残片。
         parsed: list[Observation] = []
-        for raw in rows:
+        for index, raw in enumerate(rows):
             try:
                 item = Observation.from_dict(raw, protocol)
             except ValidationError as exc:
-                raise ValidationFailed(str(exc)) from exc
-            if item.robot_id != self.connection.execute(
-                "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
-            ).fetchone()["robot_id"]:
-                raise ValidationFailed("观测机器人与批次构建不一致")
+                raise ValidationFailed(
+                    f"第 {index} 行观测校验失败: {exc}",
+                    details={"index": index, "field": exc.field or "observations"},
+                ) from exc
+            if item.robot_id != expected_robot:
+                raise ValidationFailed(
+                    f"第 {index} 行观测机器人与批次构建不一致",
+                    details={"index": index, "field": "observation.robot_id"},
+                )
             parsed.append(item)
         response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
         try:
             with transaction(self.connection, immediate=True):
+                # 取得写锁后再次确认幂等键，让并发的同内容重放也返回原结果。
+                concurrent = self._idempotent_response(scope, idempotency_key, request_digest)
+                if concurrent is not None:
+                    return concurrent
                 for item, raw in zip(parsed, rows):
                     self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
                         "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,

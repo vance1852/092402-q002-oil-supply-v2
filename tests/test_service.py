@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from robot_trials.clock import FrozenClock
-from robot_trials.errors import Conflict, Forbidden, InvalidState
+from robot_trials.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from robot_trials.jsonio import load_json
 from robot_trials.service import TrialService
 
@@ -118,6 +118,58 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(second["lease_owner"], "worker-b")
         with self.assertRaises(InvalidState):
             self.service.complete_job("worker-a", first["job_id"], "stat")
+
+    def _bad_rows(self, **changes: object) -> list[dict[str, object]]:
+        rows = [dict(item) for item in self.rows]
+        rows[2] = dict(rows[2])
+        rows[2].update(changes)
+        return rows
+
+    def test_invalid_timestamp_leaves_no_fragments(self) -> None:
+        rows = self._bad_rows(observed_at="2026-09-21 09:20")
+        with self.assertRaises(ValidationFailed) as ctx:
+            self.service.import_observations("operator", "batch-a", "bad-key", rows)
+        self.assertEqual(ctx.exception.details, {"index": 2, "field": "observation.observed_at"})
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM observations").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM idempotency_keys").fetchone()[0], 0)
+        imported_audit = self.connection.execute(
+            "SELECT count(*) FROM audit_events WHERE event_type='observations.imported'"
+        ).fetchone()[0]
+        self.assertEqual(imported_audit, 0)
+        # 同一幂等键修正内容后可正常导入，且成功重放返回原结果。
+        fixed = self._bad_rows(observed_at="2026-09-21T09:20:00+08:00")
+        first = self.service.import_observations("operator", "batch-a", "bad-key", fixed)
+        replay = self.service.import_observations("operator", "batch-a", "bad-key", fixed)
+        self.assertEqual(first, replay)
+        self.assertEqual(first["inserted"], 6)
+
+    def test_negative_count_leaves_no_fragments(self) -> None:
+        rows = self._bad_rows()
+        rows[2]["metrics"] = dict(rows[2]["metrics"])
+        rows[2]["metrics"]["interventions"] = -3
+        with self.assertRaises(ValidationFailed) as ctx:
+            self.service.import_observations("operator", "batch-a", "neg-key", rows)
+        self.assertEqual(ctx.exception.details, {"index": 2, "field": "observation.metrics.interventions"})
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM observations").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM idempotency_keys").fetchone()[0], 0)
+        audit = self.connection.execute(
+            "SELECT count(*) FROM audit_events WHERE event_type='observations.imported'"
+        ).fetchone()[0]
+        self.assertEqual(audit, 0)
+
+    def test_legal_batch_still_replays_original_result(self) -> None:
+        first = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        second = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.assertEqual(second, first)
+        stored = self.connection.execute(
+            "SELECT observed_at FROM observations WHERE source_row='001'"
+        ).fetchone()[0]
+        self.assertEqual(stored, "2026-09-21T01:00:00Z")
+
+    def test_empty_array_points_at_observations_field(self) -> None:
+        with self.assertRaises(ValidationFailed) as ctx:
+            self.service.import_observations("operator", "batch-a", "empty", [])
+        self.assertEqual(ctx.exception.details, {"field": "observations"})
 
 
 if __name__ == "__main__":
