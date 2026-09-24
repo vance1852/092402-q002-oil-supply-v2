@@ -57,6 +57,58 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "必须是 0 或 1"):
             Observation.from_dict(raw, self.protocol)
 
+    def _observation_raw(self, **overrides: object) -> dict[str, object]:
+        raw = {
+            "source_batch": "batch",
+            "source_row": "1",
+            "robot_id": "r1",
+            "protocol_id": self.protocol.protocol_id,
+            "protocol_version": self.protocol.version,
+            "stratum_key": "clear-aisle",
+            "observed_at": "2026-09-21T10:00:00+08:00",
+            "metrics": {"completed": 1, "completion_seconds": 4, "interventions": 0},
+            "excluded_reason": None,
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_observed_at_requires_iso8601_instant(self) -> None:
+        for bad in ("昨天下午三点", "2026/09/21 10:00:00", "2026-09-21T10:00:00", "2026-09-21", 12345, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError) as caught:
+                    Observation.from_dict(self._observation_raw(observed_at=bad), self.protocol)
+                self.assertEqual(caught.exception.field, "observation.observed_at")
+
+    def test_observed_at_is_normalized_to_utc(self) -> None:
+        item = Observation.from_dict(
+            self._observation_raw(observed_at="2026-09-21T10:00:00+08:00"), self.protocol
+        )
+        self.assertEqual(item.observed_at, "2026-09-21T02:00:00Z")
+        zulu = Observation.from_dict(
+            self._observation_raw(observed_at="2026-09-21T02:00:00Z"), self.protocol
+        )
+        self.assertEqual(zulu.observed_at, item.observed_at)
+
+    def test_count_metric_cannot_be_negative(self) -> None:
+        with self.assertRaises(ValidationError) as caught:
+            Observation.from_dict(
+                self._observation_raw(
+                    metrics={"completed": 1, "completion_seconds": 4, "interventions": -1}
+                ),
+                self.protocol,
+            )
+        self.assertEqual(caught.exception.field, "observation.metrics.interventions")
+
+    def test_count_metric_must_be_integral(self) -> None:
+        with self.assertRaises(ValidationError) as caught:
+            Observation.from_dict(
+                self._observation_raw(
+                    metrics={"completed": 1, "completion_seconds": 4, "interventions": "1.5"}
+                ),
+                self.protocol,
+            )
+        self.assertEqual(caught.exception.field, "observation.metrics.interventions")
+
 
 if __name__ == "__main__":
     unittest.main()

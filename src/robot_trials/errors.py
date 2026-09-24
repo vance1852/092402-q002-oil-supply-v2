@@ -29,3 +29,7 @@ class InvalidState(ServiceError):
 class ValidationFailed(ServiceError):
     code = "validation_failed"
     status = 422
+
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        super().__init__(message)
+        self.field = field

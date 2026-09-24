@@ -32,7 +32,7 @@ class JsonApplication:
     def _actor(headers: Mapping[str, str]) -> str:
         actor = headers.get("x-actor-id", "").strip()
         if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
+            raise ValidationFailed("缺少 X-Actor-Id", field="X-Actor-Id")
         return actor
 
     @staticmethod
@@ -87,7 +87,7 @@ class JsonApplication:
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "observations":
                 key = normalized_headers.get("idempotency-key", "").strip()
                 if not key:
-                    raise ValidationFailed("缺少 Idempotency-Key")
+                    raise ValidationFailed("缺少 Idempotency-Key", field="Idempotency-Key")
                 result = self.service.import_observations(
                     self._actor(normalized_headers), parts[1], key, payload.get("observations", [])
                 )
@@ -135,7 +135,11 @@ class JsonApplication:
                 return Response(201, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            field = getattr(exc, "field", None)
+            if field:
+                error["field"] = field
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

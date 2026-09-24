@@ -3,29 +3,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 
 class ValidationError(ValueError):
-    """输入不能满足领域契约。"""
+    """输入不能满足领域契约；field 为稳定的机器可读字段路径。"""
+
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        super().__init__(message)
+        self.field = field
 
 
 def _require_mapping(value: object, path: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValidationError(f"{path} 必须是对象")
+        raise ValidationError(f"{path} 必须是对象", field=path)
     return value
 
 
 def _require_sequence(value: object, path: str) -> Sequence[Any]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
-        raise ValidationError(f"{path} 必须是数组")
+        raise ValidationError(f"{path} 必须是数组", field=path)
     return value
 
 
 def _required_text(value: object, path: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValidationError(f"{path} 必须是非空字符串")
+        raise ValidationError(f"{path} 必须是非空字符串", field=path)
     return value.strip()
 
 
@@ -37,14 +42,28 @@ def _optional_text(value: object, path: str) -> str | None:
 
 def _decimal(value: object, path: str) -> Decimal:
     if isinstance(value, bool):
-        raise ValidationError(f"{path} 必须是数值")
+        raise ValidationError(f"{path} 必须是数值", field=path)
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise ValidationError(f"{path} 必须是十进制数值") from exc
+        raise ValidationError(f"{path} 必须是十进制数值", field=path) from exc
     if not result.is_finite():
-        raise ValidationError(f"{path} 必须是有限数值")
+        raise ValidationError(f"{path} 必须是有限数值", field=path)
     return result
+
+
+def _instant(value: object, path: str) -> str:
+    """解析带时区的 ISO 8601 时刻，并规范化为 UTC 的 Z 后缀表示。"""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{path} 必须是带时区的 ISO 8601 时刻", field=path)
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise ValidationError(f"{path} 必须是 ISO 8601 时刻", field=path) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValidationError(f"{path} 必须带时区偏移", field=path)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +79,9 @@ class Stratum:
         data = _require_mapping(raw, path)
         required_trials = data.get("required_trials")
         if isinstance(required_trials, bool) or not isinstance(required_trials, int):
-            raise ValidationError(f"{path}.required_trials 必须是整数")
+            raise ValidationError(f"{path}.required_trials 必须是整数", field=f"{path}.required_trials")
         if required_trials <= 0:
-            raise ValidationError(f"{path}.required_trials 必须大于零")
+            raise ValidationError(f"{path}.required_trials 必须大于零", field=f"{path}.required_trials")
         return cls(
             key=_required_text(data.get("key"), f"{path}.key"),
             label=_required_text(data.get("label"), f"{path}.label"),
@@ -218,24 +237,35 @@ class Observation:
         protocol_id = _required_text(data.get("protocol_id"), "observation.protocol_id")
         protocol_version = data.get("protocol_version")
         if protocol_id != protocol.protocol_id or protocol_version != protocol.version:
-            raise ValidationError("观测引用的协议版本与当前协议不一致")
+            raise ValidationError(
+                "观测引用的协议版本与当前协议不一致",
+                field="observation.protocol_version",
+            )
         stratum_key = _required_text(data.get("stratum_key"), "observation.stratum_key")
         if stratum_key not in protocol.stratum_keys:
-            raise ValidationError("observation.stratum_key 未在协议中声明")
+            raise ValidationError("observation.stratum_key 未在协议中声明", field="observation.stratum_key")
         metric_data = _require_mapping(data.get("metrics"), "observation.metrics")
         expected = protocol.metric_map
         missing = sorted(set(expected) - set(metric_data))
         extra = sorted(set(metric_data) - set(expected))
         if missing or extra:
-            raise ValidationError(f"观测指标不匹配：缺少 {missing}，多出 {extra}")
+            key = missing[0] if missing else extra[0]
+            raise ValidationError(
+                f"观测指标不匹配：缺少 {missing}，多出 {extra}",
+                field=f"observation.metrics.{key}",
+            )
         parsed: dict[str, Decimal] = {}
         for key, value in metric_data.items():
             metric = expected[key]
-            number = _decimal(value, f"observation.metrics.{key}")
+            field_path = f"observation.metrics.{key}"
+            number = _decimal(value, field_path)
             if metric.kind == "binary" and number not in {Decimal(0), Decimal(1)}:
-                raise ValidationError(f"observation.metrics.{key} 必须是 0 或 1")
-            if metric.kind == "count" and number != number.to_integral_value():
-                raise ValidationError(f"observation.metrics.{key} 必须是整数")
+                raise ValidationError(f"{field_path} 必须是 0 或 1", field=field_path)
+            if metric.kind == "count":
+                if number != number.to_integral_value():
+                    raise ValidationError(f"{field_path} 必须是非负整数", field=field_path)
+                if number < 0:
+                    raise ValidationError(f"{field_path} 不得为负数", field=field_path)
             parsed[key] = number
         return cls(
             source_batch=_required_text(data.get("source_batch"), "observation.source_batch"),
@@ -244,7 +274,7 @@ class Observation:
             protocol_id=protocol_id,
             protocol_version=protocol.version,
             stratum_key=stratum_key,
-            observed_at=_required_text(data.get("observed_at"), "observation.observed_at"),
+            observed_at=_instant(data.get("observed_at"), "observation.observed_at"),
             metrics=parsed,
             excluded_reason=_optional_text(data.get("excluded_reason"), "observation.excluded_reason"),
         )

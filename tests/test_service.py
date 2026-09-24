@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from robot_trials.clock import FrozenClock
-from robot_trials.errors import Conflict, Forbidden, InvalidState
+from robot_trials.errors import Conflict, Forbidden, InvalidState, ValidationFailed
 from robot_trials.jsonio import load_json
 from robot_trials.service import TrialService
 
@@ -73,6 +73,64 @@ class ServiceTests(unittest.TestCase):
             self.service.import_observations("operator", "batch-a", "key-2", self.rows[:2])
         count = self.connection.execute("SELECT count(*) FROM observations").fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_invalid_row_leaves_no_residue(self) -> None:
+        def residue() -> tuple[int, int, int]:
+            return (
+                self.connection.execute("SELECT count(*) FROM observations").fetchone()[0],
+                self.connection.execute("SELECT count(*) FROM idempotency_keys").fetchone()[0],
+                self.connection.execute(
+                    "SELECT count(*) FROM audit_events WHERE event_type='observations.imported'"
+                ).fetchone()[0],
+            )
+
+        cases = (
+            ("bad-time", {"observed_at": "无法解析的时间"}),
+            ("naive-time", {"observed_at": "2026-09-21T09:00:00"}),
+            (
+                "negative-count",
+                {"metrics": {"completed": 1, "completion_seconds": "42.8", "interventions": -1}},
+            ),
+        )
+        for index, (key, overrides) in enumerate(cases):
+            bad = [dict(self.rows[0]) | {"source_row": f"bad-{key}"}]
+            bad[0].update(overrides)
+            with self.subTest(key=key):
+                with self.assertRaises(ValidationFailed) as caught:
+                    self.service.import_observations("operator", "batch-a", key, bad)
+                self.assertIsNotNone(caught.exception.field)
+            self.assertEqual(residue(), (0, 0, 0))
+
+        # 第二行非法时，第一行合法数据也不得残留。
+        mixed = [
+            dict(self.rows[0]) | {"source_row": "mix-1"},
+            dict(self.rows[1]) | {"source_row": "mix-2", "observed_at": "not-a-time"},
+        ]
+        with self.assertRaises(ValidationFailed) as caught:
+            self.service.import_observations("operator", "batch-a", "mixed-key", mixed)
+        self.assertEqual(caught.exception.field, "observations[1].observed_at")
+        self.assertEqual(residue(), (0, 0, 0))
+
+        # 失败的幂等键可在数据修正后用于合法导入。
+        fixed = [dict(mixed[1]) | {"observed_at": "2026-09-21T09:10:00+08:00"}]
+        result = self.service.import_observations("operator", "batch-a", "mixed-key", fixed)
+        self.assertEqual(result["inserted"], 1)
+
+    def test_invalid_row_field_points_to_specific_row_and_field(self) -> None:
+        bad = [dict(self.rows[0]) | {
+            "source_row": "neg",
+            "metrics": {"completed": 1, "completion_seconds": "42.8", "interventions": -2},
+        }]
+        with self.assertRaises(ValidationFailed) as caught:
+            self.service.import_observations("operator", "batch-a", "neg-key", bad)
+        self.assertEqual(caught.exception.field, "observations[0].metrics.interventions")
+
+    def test_valid_import_normalizes_observed_at_to_utc(self) -> None:
+        self.service.import_observations("operator", "batch-a", "key-1", self.rows[:1])
+        stored = self.connection.execute(
+            "SELECT observed_at FROM observations WHERE source_row='001'"
+        ).fetchone()[0]
+        self.assertEqual(stored, "2026-09-21T01:00:00Z")
 
     def test_role_separation(self) -> None:
         with self.assertRaises(Forbidden):

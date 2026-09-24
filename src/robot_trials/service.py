@@ -115,7 +115,7 @@ class TrialService:
         try:
             protocol = Protocol.from_dict(raw)
         except ValidationError as exc:
-            raise ValidationFailed(str(exc)) from exc
+            raise ValidationFailed(str(exc), field=exc.field) from exc
         text = canonical_json(raw)
         digest = content_digest([raw])
         try:
@@ -210,52 +210,80 @@ class TrialService:
         self._require(actor_id, "observation.import")
         rows = tuple(raw_rows)
         if not rows:
-            raise ValidationFailed("观测数组不能为空")
+            raise ValidationFailed("观测数组不能为空", field="observations")
         request_digest = content_digest(rows)
         scope = f"observations:{batch_id}"
+
+        # 幂等命中直接返回原结果，不产生任何写入。
         existing = self._idempotent_response(scope, idempotency_key, request_digest)
         if existing is not None:
             return existing
+
         batch = self.get_batch(batch_id)
         if batch["state"] != "running":
             raise InvalidState("只有运行中的批次可以导入观测")
         protocol, _ = self._protocol(batch["protocol_id"], batch["protocol_version"])
-        parsed: list[Observation] = []
-        for raw in rows:
+        build_row = self.connection.execute(
+            "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
+        ).fetchone()
+        if build_row is None:
+            raise NotFound("批次构建不存在")
+
+        # 先把整批数据全部校验通过；任一行不合法都不进入写入事务，
+        # 因此不会留下观测、幂等响应或审计残片。
+        parsed: list[tuple[Observation, Mapping[str, Any]]] = []
+        for index, raw in enumerate(rows):
             try:
                 item = Observation.from_dict(raw, protocol)
             except ValidationError as exc:
-                raise ValidationFailed(str(exc)) from exc
-            if item.robot_id != self.connection.execute(
-                "SELECT robot_id FROM builds WHERE build_id=?", (batch["build_id"],)
-            ).fetchone()["robot_id"]:
-                raise ValidationFailed("观测机器人与批次构建不一致")
-            parsed.append(item)
+                field = exc.field
+                if field is not None:
+                    field = f"observations[{index}].{field.removeprefix('observation.')}"
+                raise ValidationFailed(f"第 {index + 1} 行观测不合法: {exc}", field=field) from exc
+            if item.robot_id != build_row["robot_id"]:
+                raise ValidationFailed(
+                    f"第 {index + 1} 行观测机器人与批次构建不一致",
+                    field=f"observations[{index}].robot_id",
+                )
+            parsed.append((item, raw))
+
         response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
         try:
             with transaction(self.connection, immediate=True):
-                for item, raw in zip(parsed, rows):
+                # 事务内复查幂等键，避免并发首请求各自写入。
+                locked = self.connection.execute(
+                    "SELECT request_sha256,response_json FROM idempotency_keys WHERE scope=? AND key=?",
+                    (scope, idempotency_key),
+                ).fetchone()
+                if locked is not None:
+                    if locked["request_sha256"] != request_digest:
+                        raise Conflict("同一幂等键对应了不同请求内容")
+                    # 并发的同内容请求已提交等效结果，直接回放。
+                    response = json.loads(locked["response_json"])
+                else:
+                    for item, raw in parsed:
+                        self.connection.execute(
+                            "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
+                            "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                batch_id,
+                                item.source_batch,
+                                item.source_row,
+                                item.robot_id,
+                                item.stratum_key,
+                                item.observed_at,
+                                canonical_json({key: format(value, "f") for key, value in item.metrics.items()}),
+                                content_digest([raw]),
+                                actor_id,
+                                self._now(),
+                            ),
+                        )
                     self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
-                        "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            batch_id,
-                            item.source_batch,
-                            item.source_row,
-                            item.robot_id,
-                            item.stratum_key,
-                            item.observed_at,
-                            canonical_json({key: format(value, "f") for key, value in item.metrics.items()}),
-                            content_digest([raw]),
-                            actor_id,
-                            self._now(),
-                        ),
+                        "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) "
+                        "VALUES(?,?,?,?,?)",
+                        (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
                     )
-                self.connection.execute(
-                    "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) VALUES(?,?,?,?,?)",
-                    (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
-                )
-                self._audit("batch", batch_id, "observations.imported", actor_id, response)
+                    self._audit("batch", batch_id, "observations.imported", actor_id, response)
         except sqlite3.IntegrityError as exc:
             raise Conflict("来源行重复或幂等键并发冲突") from exc
         return response
